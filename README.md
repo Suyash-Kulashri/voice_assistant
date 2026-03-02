@@ -1,4 +1,4 @@
-# Voice Assistant — Phase 3 (Intelligence Layer)
+# Voice Assistant
 
 End-to-end pipeline: **audio in → Deepgram STT → intent → context + long-term memory → filler → Groq LLM → TTS** over WebSockets. Interruptions handled with barge-in; context and memory keep conversations natural.
 
