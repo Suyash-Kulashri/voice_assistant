@@ -9,6 +9,7 @@ deepgram-sdk>=3.0.0
 
 # LLM
 groq>=0.4.0
+openai
 
 # TTS
 elevenlabs>=1.0.0
@@ -17,3 +18,9 @@ elevenlabs>=1.0.0
 redis>=5.0.0
 langchain-redis>=0.1.0
 langchain-core>=0.3.0
+numpy
+tavily
+
+# Vector DB
+milvus
+pymilvus

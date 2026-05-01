@@ -24,6 +24,7 @@ build/
 *.mp3
 /tmp/
 response.mp3
+embedded_output.jsonl
 
 # IDE / OS
 .idea/

@@ -1,0 +1,104 @@
+# Milvus Standalone Docker Compose for AI Chat Agent
+# Unique container names and ports to avoid conflicts
+# 
+# Usage:
+#   Start:   docker-compose -f docker-compose-milvus.yml up -d
+#   Stop:    docker-compose -f docker-compose-milvus.yml down
+#   Logs:    docker-compose -f docker-compose-milvus.yml logs -f
+#   Status:  docker-compose -f docker-compose-milvus.yml ps
+#
+# Ports used:
+#   - 19532: Milvus gRPC (main connection)
+#   - 9192: Milvus health check
+#   - 9010: MinIO API
+#   - 9011: MinIO Console
+#
+# Required Environment Variable for your app:
+#   MILVUS_URI=http://localhost:19532
+#
+# Data Storage (EC2):
+#   All Milvus data is stored in /home/ubuntu/milvus_standalone_data/
+#   This directory must be created before starting: sudo mkdir -p /home/ubuntu/milvus_standalone_data
+
+services:
+  aichat-etcd:
+    container_name: aichat-milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - /home/ubuntu/milvus_standalone_data/etcd:/etcd
+    command: etcd -advertise-client-urls=http://aichat-etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - aichat-milvus-network
+    restart: unless-stopped
+
+  aichat-minio:
+    container_name: aichat-milvus-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9011:9001"
+      - "9010:9000"
+    volumes:
+      - /home/ubuntu/milvus_standalone_data/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - aichat-milvus-network
+    restart: unless-stopped
+
+  aichat-milvus:
+    container_name: aichat-milvus-standalone
+    image: milvusdb/milvus:v2.4.4
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: aichat-etcd:2379
+      MINIO_ADDRESS: aichat-minio:9000
+    volumes:
+      - /home/ubuntu/milvus_standalone_data/milvus:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "19532:19530"
+      - "9192:9091"
+    depends_on:
+      - aichat-etcd
+      - aichat-minio
+    networks:
+      - aichat-milvus-network
+    restart: unless-stopped
+
+networks:
+  aichat-milvus-network:
+    name: aichat-milvus-network
+    driver: bridge
+
+# ============================================================================
+# ORIGINAL LOCAL DEVELOPMENT VOLUME PATHS (for reference):
+# ============================================================================
+# If running locally (not on EC2), replace /home/ubuntu/milvus_standalone_data with:
+#   - ${DOCKER_VOLUME_DIRECTORY:-.}/milvus_standalone_data/etcd:/etcd
+#   - ${DOCKER_VOLUME_DIRECTORY:-.}/milvus_standalone_data/minio:/minio_data
+#   - ${DOCKER_VOLUME_DIRECTORY:-.}/milvus_standalone_data/milvus:/var/lib/milvus
+# ============================================================================

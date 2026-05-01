@@ -32,6 +32,15 @@ from app.services.long_term_memory import (
     format_facts_for_prompt,
 )
 from app.services.fillers import get_filler_phrase
+from app.services.rag import (
+    build_rag_context,
+    build_sources,
+    is_smalltalk_or_greeting,
+    is_product_info_query,
+    retrieve_context,
+)
+from app.services.product_matcher import match_product_name
+from app.services.tavily_search import has_tavily, tavily_fallback_answer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,6 +49,64 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful voice assistant. Keep replies concise
 
 SENTENCE_END_RE = re.compile(r"[.!?\n]")
 MAX_BUFFER_LEN = 120
+NO_CONTEXT_REPLY = "I don't have that specific information in the provided datasheets"
+TAVILY_CONFIRM_REPLY = (
+    "I do not have information regarding this in my datasheets, "
+    "but I can search it on Google (Advanced Energy and DigiKey) if you allow. "
+    "Please reply with yes or no."
+)
+_pending_tavily: dict[str, dict] = {}
+
+
+def _build_product_suggestion_reply(suggestions):
+    if not suggestions:
+        return (
+            "I could not confidently match that product name from my catalog. "
+            "Please provide the exact product or series name."
+        )
+    top = suggestions[:5]
+    lines = [
+        "I could not confidently match that product name. Did you mean one of these?",
+    ]
+    for s in top:
+        lines.append(f"- {s}")
+    lines.append("Please reply with the exact product/series name from the list.")
+    return "\n".join(lines)
+
+
+def _is_no_context_reply(text: str) -> bool:
+    t = (text or "").strip().lower()
+    baseline = NO_CONTEXT_REPLY.lower()
+    return baseline in t or "i don't have that specific information in the provided datasheets" in t
+
+
+def _is_yes(text: str) -> bool:
+    t = re.sub(r"[^a-z\s]", " ", (text or "").strip().lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    yes_phrases = {
+        "yes",
+        "y",
+        "ok",
+        "okay",
+        "sure",
+        "please do",
+        "go ahead",
+        "yes please",
+        "search it",
+        "search on google",
+    }
+    if t in yes_phrases:
+        return True
+    return ("yes" in t or "sure" in t or "okay" in t or "ok" in t) and ("no" not in t)
+
+
+def _is_no(text: str) -> bool:
+    t = re.sub(r"[^a-z\s]", " ", (text or "").strip().lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    no_phrases = {"no", "n", "nope", "not now", "cancel", "do not", "don't"}
+    if t in no_phrases:
+        return True
+    return "no" in t and "yes" not in t
 
 
 @asynccontextmanager
@@ -324,8 +391,89 @@ async def handle_text_message(websocket: WebSocket, session_id: str, text: str):
     reply_id = str(uuid.uuid4())
     await websocket.send_text(json.dumps({"type": "reply_start", "reply_id": reply_id}))
 
+    pending = _pending_tavily.get(session_id)
+    if pending:
+        if _is_yes(text):
+            try:
+                result = await tavily_fallback_answer(pending["product_name"], pending["original_query"])
+                reply_text = result.get("answer") or NO_CONTEXT_REPLY
+                reply_sources = result.get("sources", [])
+            except Exception as e:
+                logger.warning("Tavily fallback failed: %s", e)
+                reply_text = "I couldn't complete the web search right now. Please try again."
+                reply_sources = []
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "reply",
+                        "text": reply_text,
+                        "reply_id": reply_id,
+                        "sources": reply_sources,
+                    }
+                )
+            )
+            add_turn(session_id, text, reply_text)
+            await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+            _pending_tavily.pop(session_id, None)
+            return
+        if _is_no(text):
+            reply_text = "Okay, I will only use the provided datasheets."
+            await websocket.send_text(json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id, "sources": []}))
+            add_turn(session_id, text, reply_text)
+            await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+            _pending_tavily.pop(session_id, None)
+            return
+
     intent = await classify_intent(text, use_llm=False)
     system_prompt = get_system_prompt(intent)
+    rag_chunks = []
+    matched_product = None
+    if not is_smalltalk_or_greeting(text):
+        # Run matching on all non-smalltalk queries to support spoken forms
+        # like "LCM thousand" that do not always match strict product regexes.
+        match = match_product_name(text)
+        product_query = (
+            is_product_info_query(text)
+            or bool(match.matched_name)
+            or bool(match.mentioned_product_like_term)
+        )
+        if product_query:
+            if match.matched_name and not match.ambiguous:
+                matched_product = match.matched_name
+            elif match.mentioned_product_like_term or match.ambiguous:
+                reply_text = _build_product_suggestion_reply(match.suggestions)
+                await websocket.send_text(
+                    json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id, "sources": []})
+                )
+                add_turn(session_id, text, reply_text)
+                await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+                return
+        try:
+            rag_chunks = await retrieve_context(
+                text, product_name=matched_product, top_k=5, min_similarity=0.25
+            )
+        except Exception as e:
+            logger.warning("RAG retrieval failed for text message: %s", e)
+        if rag_chunks:
+            system_prompt = system_prompt + "\n\n" + build_rag_context(rag_chunks, text, matched_product)
+        else:
+            if matched_product and has_tavily():
+                _pending_tavily[session_id] = {
+                    "product_name": matched_product,
+                    "original_query": text,
+                }
+                reply_text = TAVILY_CONFIRM_REPLY
+                await websocket.send_text(
+                    json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id, "sources": []})
+                )
+                add_turn(session_id, text, reply_text)
+                await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+                return
+            reply_text = NO_CONTEXT_REPLY
+            await websocket.send_text(json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id}))
+            add_turn(session_id, text, reply_text)
+            await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+            return
     summary, history = await get_messages_with_summary(session_id)
     if summary:
         system_prompt = system_prompt + "\n\n" + summary
@@ -339,7 +487,24 @@ async def handle_text_message(websocket: WebSocket, session_id: str, text: str):
         await websocket.send_text(json.dumps({"type": "reply_delta", "text": token, "reply_id": reply_id}))
 
     reply_text = "".join(full_reply_parts).strip()
-    await websocket.send_text(json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id}))
+    if matched_product and has_tavily() and _is_no_context_reply(reply_text):
+        _pending_tavily[session_id] = {
+            "product_name": matched_product,
+            "original_query": text,
+        }
+        reply_text = TAVILY_CONFIRM_REPLY
+        await websocket.send_text(
+            json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id, "sources": []})
+        )
+        add_turn(session_id, text, reply_text)
+        await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+        return
+    sources = []
+    if rag_chunks and not _is_no_context_reply(reply_text):
+        sources = build_sources(rag_chunks)
+    await websocket.send_text(
+        json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id, "sources": sources})
+    )
     add_turn(session_id, text, reply_text)
     asyncio.create_task(extract_and_store_facts_async(session_id, text, reply_text))
     await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
@@ -372,14 +537,116 @@ async def handle_audio_streaming_final(
 
     if not transcript:
         reply_text = "I didn't catch that. Could you say it again?"
-        await _stream_tts_segment(websocket, asyncio.get_event_loop(), reply_text, reply_aborted)
+        await _stream_tts_segment(
+            websocket, asyncio.get_event_loop(), reply_text, reply_aborted, reply_id=reply_id
+        )
         await websocket.send_text(json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id}))
         await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
         return
 
     reply_aborted.clear()
+
+    pending = _pending_tavily.get(session_id)
+    if pending:
+        if _is_yes(transcript):
+            try:
+                result = await tavily_fallback_answer(pending["product_name"], pending["original_query"])
+                reply_text = result.get("answer") or NO_CONTEXT_REPLY
+                reply_sources = result.get("sources", [])
+            except Exception as e:
+                logger.warning("Tavily fallback failed: %s", e)
+                reply_text = "I couldn't complete the web search right now. Please try again."
+                reply_sources = []
+            await _stream_tts_segment(
+                websocket, asyncio.get_event_loop(), reply_text, reply_aborted, reply_id=reply_id
+            )
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "reply",
+                        "text": reply_text,
+                        "reply_id": reply_id,
+                        "sources": reply_sources,
+                    }
+                )
+            )
+            add_turn(session_id, transcript, reply_text)
+            await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+            _pending_tavily.pop(session_id, None)
+            return
+        if _is_no(transcript):
+            reply_text = "Okay, I will only use the provided datasheets."
+            await _stream_tts_segment(
+                websocket, asyncio.get_event_loop(), reply_text, reply_aborted, reply_id=reply_id
+            )
+            await websocket.send_text(
+                json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id, "sources": []})
+            )
+            add_turn(session_id, transcript, reply_text)
+            await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+            _pending_tavily.pop(session_id, None)
+            return
+
     intent = await classify_intent(transcript, use_llm=False)
     system_prompt = get_system_prompt(intent)
+    rag_chunks = []
+    matched_product = None
+    if not is_smalltalk_or_greeting(transcript):
+        # Same behavior as text flow: keep product matching active even when
+        # STT rewrites model names into spoken forms.
+        match = match_product_name(transcript)
+        product_query = (
+            is_product_info_query(transcript)
+            or bool(match.matched_name)
+            or bool(match.mentioned_product_like_term)
+        )
+        if product_query:
+            if match.matched_name and not match.ambiguous:
+                matched_product = match.matched_name
+            elif match.mentioned_product_like_term or match.ambiguous:
+                reply_text = _build_product_suggestion_reply(match.suggestions)
+                await _stream_tts_segment(
+                    websocket, asyncio.get_event_loop(), reply_text, reply_aborted, reply_id=reply_id
+                )
+                await websocket.send_text(
+                    json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id, "sources": []})
+                )
+                await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+                return
+        try:
+            rag_chunks = await retrieve_context(
+                transcript, product_name=matched_product, top_k=5, min_similarity=0.25
+            )
+        except Exception as e:
+            logger.warning("RAG retrieval failed for voice transcript: %s", e)
+        if rag_chunks:
+            system_prompt = system_prompt + "\n\n" + build_rag_context(
+                rag_chunks, transcript, matched_product
+            )
+        else:
+            if matched_product and has_tavily():
+                _pending_tavily[session_id] = {
+                    "product_name": matched_product,
+                    "original_query": transcript,
+                }
+                reply_text = TAVILY_CONFIRM_REPLY
+                await _stream_tts_segment(
+                    websocket, asyncio.get_event_loop(), reply_text, reply_aborted, reply_id=reply_id
+                )
+                await websocket.send_text(
+                    json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id, "sources": []})
+                )
+                await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+                return
+            reply_text = NO_CONTEXT_REPLY
+            await _stream_tts_segment(
+                websocket, asyncio.get_event_loop(), reply_text, reply_aborted, reply_id=reply_id
+            )
+            await websocket.send_text(
+                json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id, "sources": []})
+            )
+            await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+            return
     summary, history = await get_messages_with_summary(session_id)
     if summary:
         system_prompt = system_prompt + "\n\n" + summary
@@ -388,7 +655,9 @@ async def handle_audio_streaming_final(
         system_prompt = system_prompt + "\n\n" + format_facts_for_prompt(facts)
 
     filler = get_filler_phrase()
-    await _stream_tts_segment(websocket, asyncio.get_event_loop(), filler, reply_aborted)
+    await _stream_tts_segment(
+        websocket, asyncio.get_event_loop(), filler, reply_aborted, reply_id=reply_id
+    )
     if reply_aborted.is_set():
         await websocket.send_text(json.dumps({"type": "done", "interrupted": True, "reply_id": reply_id}))
         return
@@ -407,15 +676,38 @@ async def handle_audio_streaming_final(
             sentence = buffer.strip()
             buffer = ""
             if sentence:
-                await _stream_tts_segment(websocket, loop, sentence, reply_aborted)
+                await _stream_tts_segment(
+                    websocket, loop, sentence, reply_aborted, reply_id=reply_id
+                )
                 if reply_aborted.is_set():
                     break
 
     if buffer.strip() and not reply_aborted.is_set():
-        await _stream_tts_segment(websocket, loop, buffer.strip(), reply_aborted)
+        await _stream_tts_segment(
+            websocket, loop, buffer.strip(), reply_aborted, reply_id=reply_id
+        )
 
     reply_text = "".join(full_reply_parts).strip()
-    await websocket.send_text(json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id}))
+    if matched_product and has_tavily() and _is_no_context_reply(reply_text):
+        _pending_tavily[session_id] = {
+            "product_name": matched_product,
+            "original_query": transcript,
+        }
+        reply_text = TAVILY_CONFIRM_REPLY
+        await _stream_tts_segment(
+            websocket, asyncio.get_event_loop(), reply_text, reply_aborted, reply_id=reply_id
+        )
+        await websocket.send_text(
+            json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id, "sources": []})
+        )
+        await websocket.send_text(json.dumps({"type": "done", "reply_id": reply_id}))
+        return
+    sources = []
+    if rag_chunks and not _is_no_context_reply(reply_text):
+        sources = build_sources(rag_chunks)
+    await websocket.send_text(
+        json.dumps({"type": "reply", "text": reply_text, "reply_id": reply_id, "sources": sources})
+    )
     if not reply_aborted.is_set():
         add_turn(session_id, transcript, reply_text)
         asyncio.create_task(extract_and_store_facts_async(session_id, transcript, reply_text))
@@ -452,7 +744,9 @@ async def handle_audio_streaming_final_with_reply(
     for sentence in _split_into_sentences(reply_text):
         if reply_aborted.is_set():
             break
-        await _stream_tts_segment(websocket, loop, sentence, reply_aborted)
+        await _stream_tts_segment(
+            websocket, loop, sentence, reply_aborted, reply_id=reply_id
+        )
     if not reply_aborted.is_set():
         add_turn(session_id, transcript, reply_text)
         asyncio.create_task(extract_and_store_facts_async(session_id, transcript, reply_text))
@@ -464,6 +758,7 @@ async def _stream_tts_segment(
     loop: asyncio.AbstractEventLoop,
     text: str,
     reply_aborted: Optional[asyncio.Event] = None,
+    reply_id: Optional[str] = None,
 ) -> None:
     """Send one TTS segment. If reply_aborted is set, stop sending and return."""
     if not text.strip():
@@ -483,6 +778,16 @@ async def _stream_tts_segment(
     t = threading.Thread(target=tts_producer)
     t.start()
     try:
+        if reply_id:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "reply_spoken_delta",
+                        "reply_id": reply_id,
+                        "text": text,
+                    }
+                )
+            )
         await websocket.send_text(json.dumps({"type": "audio_segment_start"}))
         while True:
             if aborted.is_set():

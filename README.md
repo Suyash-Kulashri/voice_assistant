@@ -79,3 +79,9 @@ voice_assistant/
 ## Success metric
 
 Conversations feel natural; interruptions are handled gracefully (barge-in stops TTS and accepts the new query).
+
+# Usefull commands
+
+sudo systemctl status voice-assistant
+sudo systemctl restart voice-assistant
+sudo journalctl -u voice-assistant -f

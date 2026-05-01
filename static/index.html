@@ -174,6 +174,10 @@
     let gainNode = null;
     let currentSource = null;
     let voiceUserMsgId = null;
+    let suppressTranscriptUntil = 0;
+    let isAssistantReplying = false;
+    let canRenderUserTranscript = true;
+    const spokenByReplyId = new Map();
 
     const wsUrl = (location.origin.replace(/^http/, 'ws') + '/ws');
     const SESSION_KEY = 'voice_assistant_session_id';
@@ -191,13 +195,95 @@
       return id;
     }
 
-    function appendMessage(role, text, id, replyId) {
-      const msg = { id: id || 'm' + Date.now(), role, text, replyId: replyId || null };
+    function escapeHtml(text) {
+      return (text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+
+    function renderAssistantText(text) {
+      const safe = escapeHtml(text);
+      const lines = safe.split('\n');
+      const rendered = [];
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) {
+          rendered.push('<br>');
+          continue;
+        }
+        const h3Match = line.match(/^###\s+(.+)$/);
+        const h2Match = line.match(/^##\s+(.+)$/);
+        const h1Match = line.match(/^#\s+(.+)$/);
+        if (h3Match) {
+          rendered.push(`<h3 style="margin:0.4rem 0 0.2rem 0;">${h3Match[1]}</h3>`);
+          continue;
+        }
+        if (h2Match) {
+          rendered.push(`<h3 style="margin:0.4rem 0 0.2rem 0;">${h2Match[1]}</h3>`);
+          continue;
+        }
+        if (h1Match) {
+          rendered.push(`<h3 style="margin:0.4rem 0 0.2rem 0;">${h1Match[1]}</h3>`);
+          continue;
+        }
+        if (/^(PRODUCT SUMMARY|TECHNICAL SPECIFICATIONS)\b/i.test(line)) {
+          rendered.push(`<h3 style="margin:0.4rem 0 0.2rem 0;">${line}</h3>`);
+          continue;
+        }
+        let body = line
+          .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+          .replace(/^[-*]\s+/, '&bull; ');
+        rendered.push(`<div>${body}</div>`);
+      }
+      return rendered.join('');
+    }
+
+    function renderMessage(el, msg) {
+      el.textContent = '';
+      const answerText = (msg.text || '').trim();
+      if (answerText) {
+        const textNode = document.createElement('div');
+        if (msg.role === 'assistant') textNode.innerHTML = renderAssistantText(answerText);
+        else textNode.textContent = answerText;
+        el.appendChild(textNode);
+      }
+      const sources = Array.isArray(msg.sources) ? msg.sources : [];
+      if (sources.length) {
+        const srcWrap = document.createElement('div');
+        srcWrap.style.marginTop = '0.5rem';
+        const title = document.createElement('div');
+        title.textContent = 'Sources:';
+        srcWrap.appendChild(title);
+        for (const s of sources) {
+          if (!s || !s.url) continue;
+          const link = document.createElement('a');
+          link.href = s.url;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.textContent = s.label || s.url;
+          link.style.display = 'block';
+          link.style.color = '#93c5fd';
+          srcWrap.appendChild(link);
+        }
+        el.appendChild(srcWrap);
+      }
+    }
+
+    function appendMessage(role, text, id, replyId, sources) {
+      const normalizedRole = role === 'user' ? 'user' : 'assistant';
+      const msg = {
+        id: id || 'm' + Date.now(),
+        role: normalizedRole,
+        text,
+        replyId: replyId || null,
+        sources: Array.isArray(sources) ? sources : []
+      };
       messages.push(msg);
       const div = document.createElement('div');
-      div.className = 'msg ' + role;
+      div.className = 'msg ' + normalizedRole;
       div.id = msg.id;
-      div.textContent = text || '';
+      renderMessage(div, msg);
       chatEl.appendChild(div);
       chatEl.scrollTop = chatEl.scrollHeight;
       return msg.id;
@@ -222,13 +308,52 @@
       return m ? m.id : null;
     }
 
-    function updateMessage(id, text, addStreaming) {
+    function normalizeForCompare(text) {
+      return (text || '')
+        // Remove common markdown markers that may appear in reply text but not in TTS text.
+        .replace(/[*_`#>~]/g, ' ')
+        // Normalize punctuation/number separators (e.g., "1,000" vs "1000").
+        .replace(/[^a-z0-9]+/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+    }
+
+    function mergeSpokenWithReply(spokenText, replyText) {
+      const spoken = (spokenText || '').trim();
+      const reply = (replyText || '').trim();
+      if (!spoken) return reply;
+      if (!reply) return spoken;
+      const nSpoken = normalizeForCompare(spoken);
+      const nReply = normalizeForCompare(reply);
+      if (nSpoken === nReply) return spoken;
+      if (nSpoken.includes(nReply)) return spoken;
+      if (nReply.includes(nSpoken)) return reply;
+      return `${spoken}\n\n${reply}`;
+    }
+
+    function ensureAssistantMessageIdForReply(replyId) {
+      if (!replyId) return getFirstPendingAssistantId();
+      if (!getMessageIdByReplyId(replyId)) assignReplyId(replyId);
+      let id = getMessageIdByReplyId(replyId);
+      if (!id) {
+        id = appendMessage('assistant', '', null, replyId);
+      }
+      return id;
+    }
+
+    function updateMessage(id, text, addStreaming, sources) {
       const el = document.getElementById(id);
       if (!el) return;
-      el.textContent = text;
-      el.classList.toggle('streaming', !!addStreaming);
       const m = messages.find(x => x.id === id);
-      if (m) m.text = text;
+      if (m) {
+        m.text = text;
+        if (Array.isArray(sources)) m.sources = sources;
+        renderMessage(el, m);
+      } else {
+        el.textContent = text;
+      }
+      el.classList.toggle('streaming', !!addStreaming);
       chatEl.scrollTop = chatEl.scrollHeight;
     }
 
@@ -337,6 +462,16 @@
         try {
           const data = JSON.parse(ev.data);
           if (data.type === 'transcript') {
+            if (
+              !voiceOn ||
+              !canRenderUserTranscript ||
+              Date.now() < suppressTranscriptUntil ||
+              isAssistantReplying ||
+              currentlyPlaying ||
+              playbackQueue.length > 0
+            ) {
+              return;
+            }
             const text = (data.text || '').trim();
             if (text) {
               if (!voiceUserMsgId) {
@@ -346,6 +481,7 @@
               }
             }
             if (data.speech_final && text) {
+              canRenderUserTranscript = false;
               const wasPlaying = currentlyPlaying || playbackQueue.length > 0;
               stopPlayback();
               if (wasPlaying && ws && ws.readyState === WebSocket.OPEN) {
@@ -356,30 +492,49 @@
             }
           } else if (data.type === 'reply_start') {
             const replyId = data.reply_id;
-            if (replyId) assignReplyId(replyId);
+            isAssistantReplying = true;
+            canRenderUserTranscript = false;
+            if (replyId) {
+              spokenByReplyId.set(replyId, '');
+              assignReplyId(replyId);
+            }
           } else if (data.type === 'reply_delta') {
             const replyId = data.reply_id;
-            if (replyId && !getMessageIdByReplyId(replyId)) assignReplyId(replyId);
-            let id = replyId ? getMessageIdByReplyId(replyId) : getFirstPendingAssistantId();
-            if (!id) {
-              id = appendMessage('assistant', '', null, null);
-              if (replyId) { const m = messages.find(x => x.id === id); if (m) m.replyId = replyId; }
-            }
+            let id = ensureAssistantMessageIdForReply(replyId);
             const m = messages.find(x => x.id === id);
             const prev = m ? m.text : '';
             const newText = (prev === '…' ? '' : prev) + (data.text || '');
             updateMessage(id, newText, true);
+          } else if (data.type === 'reply_spoken_delta') {
+            const replyId = data.reply_id;
+            if (!replyId) return;
+            const id = ensureAssistantMessageIdForReply(replyId);
+            const spokenPart = (data.text || '').trim();
+            if (!spokenPart) return;
+            const prevSpoken = spokenByReplyId.get(replyId) || '';
+            const nextSpoken = `${prevSpoken}${prevSpoken ? ' ' : ''}${spokenPart}`.trim();
+            spokenByReplyId.set(replyId, nextSpoken);
+            const m = messages.find(x => x.id === id);
+            const current = m ? (m.text || '') : '';
+            const merged = mergeSpokenWithReply(nextSpoken, current === '…' ? '' : current);
+            updateMessage(id, merged, true);
           } else if (data.type === 'reply') {
             const replyId = data.reply_id;
-            if (replyId && !getMessageIdByReplyId(replyId)) assignReplyId(replyId);
-            let id = replyId ? getMessageIdByReplyId(replyId) : getFirstPendingAssistantId();
-            if (!id) appendMessage('assistant', data.text || '—', null, replyId || null);
-            else updateMessage(id, data.text || '—', false);
+            const id = ensureAssistantMessageIdForReply(replyId);
+            // Prefer canonical final reply text so formatting stays clean.
+            const finalText = (data.text || '').trim();
+            if (finalText) updateMessage(id, finalText, false, data.sources || []);
+            else {
+              const spokenText = replyId ? (spokenByReplyId.get(replyId) || '') : '';
+              updateMessage(id, spokenText || '—', false, data.sources || []);
+            }
           } else if (data.type === 'audio_segment_start') {
             segmentChunks = [];
             collectingSegment = true;
+            suppressTranscriptUntil = Date.now() + 1500;
           } else if (data.type === 'audio_segment_end') {
             collectingSegment = false;
+            suppressTranscriptUntil = Date.now() + 1000;
             if (segmentChunks.length) {
               const totalBytes = segmentChunks.reduce((s, c) => s + c.byteLength, 0);
               console.log('[audio] segment received:', segmentChunks.length, 'chunks,', totalBytes, 'bytes');
@@ -390,11 +545,28 @@
               console.warn('[audio] empty segment (no chunks received)');
             }
           } else if (data.type === 'done') {
+            const replyId = data.reply_id;
+            if (replyId) {
+              const id = getMessageIdByReplyId(replyId);
+              const spokenText = spokenByReplyId.get(replyId) || '';
+              if (id && spokenText) {
+                const m = messages.find(x => x.id === id);
+                const current = m ? (m.text || '') : '';
+                // On interruption, keep exactly what was spoken.
+                // On normal completion, keep canonical final text already rendered by `reply`.
+                const finalText = data.interrupted ? spokenText : current;
+                updateMessage(id, finalText, false);
+              }
+              spokenByReplyId.delete(replyId);
+            }
+            isAssistantReplying = false;
             if (data.interrupted) stopPlayback();
             else if (!currentlyPlaying && playbackQueue.length === 0) {
               if (voiceOn) setStatus('Listening…', 'listening');
               else setStatus('Done.', '');
             }
+            suppressTranscriptUntil = Date.now() + 1200;
+            canRenderUserTranscript = true;
           } else if (data.type === 'memory_cleared') {
             messages = [];
             chatEl.innerHTML = '';
@@ -422,6 +594,7 @@
       }
       voiceOn = !voiceOn;
       if (voiceOn) {
+        canRenderUserTranscript = true;
         btnVoice.textContent = 'Disable voice';
         btnVoice.classList.add('active');
         setStatus('Listening…', 'listening');
@@ -445,6 +618,7 @@
         btnVoice.classList.remove('active');
         setStatus('Voice off.', '');
         voiceUserMsgId = null;
+        canRenderUserTranscript = false;
         stopPCMStream();
       }
     }
